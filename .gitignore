@@ -1,0 +1,9 @@
+# Secrets — never commit
+.env
+credentials.json
+
+# Python virtual environment
+venv/
+
+
+
