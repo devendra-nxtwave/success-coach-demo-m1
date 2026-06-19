@@ -1,3 +1,4 @@
+from langchain.tools import tool
 import streamlit as st
 
 from langchain_chroma import Chroma
