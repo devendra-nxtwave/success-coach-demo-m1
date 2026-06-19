@@ -1,9 +1,28 @@
-# Secrets — never commit
+# Environment variables
 .env
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Google credentials
 credentials.json
+*.json
 
-# Python virtual environment
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
 venv/
+.venv/
+env/
 
+# OS files
+.DS_Store
 
+# Jupyter files (if any)
+.ipynb_checkpoints/
 
+# Logs
+*.log

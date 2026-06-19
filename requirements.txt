@@ -3,3 +3,5 @@ openai==2.43.0
 python-dotenv==1.2.2
 langchain
 langchain-openai
+gspread
+google-auth
