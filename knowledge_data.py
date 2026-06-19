@@ -1,25 +1,21 @@
-import os
-from dotenv import load_dotenv
+import streamlit as st
 
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 
 
-load_dotenv()
-
-
 embeddings = OpenAIEmbeddings(
     model="text-embedding-3-small",
-    api_key=os.getenv("OPENAI_API_KEY")
+    api_key=st.secrets["OPENAI_API_KEY"]
 )
 
 
 vectorstore = Chroma(
     collection_name="course_material",
     embedding_function=embeddings,
-    chroma_cloud_api_key=os.getenv("CHROMA_API_KEY"),
-    tenant=os.getenv("CHROMA_TENANT"),
-    database=os.getenv("CHROMA_DATABASE")
+    chroma_cloud_api_key=st.secrets["CHROMA_API_KEY"],
+    tenant=st.secrets["CHROMA_TENANT"],
+    database=st.secrets["CHROMA_DATABASE"]
 )
 
 
