@@ -26,3 +26,10 @@ env/
 
 # Logs
 *.log
+
+
+
+# Chroma database
+knowledge_base/
+chroma_db/
+

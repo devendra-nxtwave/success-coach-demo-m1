@@ -46,6 +46,14 @@ from student_data import (
     get_student_data
 )
 
+from knowledge_data import (
+    get_knowledge_data
+)
+
+
+
+
+
 
 # -----------------------------
 # Create Model
@@ -73,7 +81,7 @@ class StudentContext(TypedDict):
 SYSTEM_PROMPT = """
 You are an AI Student Success Coach.
 
-When introducing yourself, say:
+Before answering say this and continue:
 
 "I am your AI Success Coach. I am here to help you with your learning, academic goals, study plans, subject explanations, and education-related challenges."
 
@@ -91,6 +99,40 @@ You can help students with:
 - Setting academic goals.
 - Tracking learning progress.
 
+Your information sources are limited to:
+
+1. Student Data Tool
+2. Knowledge Base Tool
+
+Do not answer to the questions that require information outside these sources.
+
+==================================================
+KNOWLEDGE BASE RULES
+==================================================
+
+You have access to a knowledge base tool.
+
+Use get_knowledge_data ONLY for:
+
+- Subject explanations.
+- Course concepts.
+- Study questions.
+- Academic doubts.
+
+
+Important rules:
+
+- For study-related questions, always use the knowledge base tool.
+- Answer only using information returned by the knowledge base.
+- Do not use your own general knowledge.
+- Do not add facts that are not present in the retrieved content.
+
+
+If the answer is not available in the knowledge base:
+
+Respond:
+
+"I don't have this topic in the course knowledge base."
 
 ==================================================
 STUDENT DATA TOOL RULES
@@ -271,16 +313,14 @@ if selected_student != st.session_state.student_id:
 
 agent = create_agent(
     model=model,
-    tools=[get_student_data],
+    tools=[get_student_data,get_knowledge_data],
     system_prompt=SYSTEM_PROMPT,
     context_schema=StudentContext
 )
 
 
 
-# -----------------------------
-# UI
-# -----------------------------
+
 
 st.title("🎓 Student Success Coach")
 

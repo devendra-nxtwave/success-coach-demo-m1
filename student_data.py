@@ -69,7 +69,7 @@ def get_student_data(runtime: ToolRuntime):
 
     """
     Fetch selected student's academic data
-    from Google Sheets.
+    from this tool.
     """
 
     # Get selected student from application context
