@@ -254,6 +254,7 @@ If the student asks about:
 - Marks disputes.
 - Grade corrections.
 - Result corrections.
+- exam related problems
 
 
 Respond exactly:
