@@ -6,7 +6,11 @@ from typing import TypedDict
 
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
-from memory.session_memory import save_session_memory
+
+from memory.session_memory import (
+    save_session_memory,
+    get_student_memory
+)
 
 
 # -----------------------------
@@ -26,6 +30,7 @@ st.set_page_config(
 load_dotenv()
 
 
+
 # -----------------------------
 # Session State
 # -----------------------------
@@ -36,6 +41,13 @@ if "student_id" not in st.session_state:
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+
+# M5 Memory State
+
+if "student_memory" not in st.session_state:
+    st.session_state.student_memory = []
+
 
 
 # -----------------------------
@@ -53,9 +65,6 @@ from knowledge_data import (
 
 
 
-
-
-
 # -----------------------------
 # Create Model
 # -----------------------------
@@ -67,6 +76,7 @@ model = ChatOpenAI(
         or st.secrets["OPENAI_API_KEY"]
     )
 )
+
 
 
 # -----------------------------
@@ -284,6 +294,7 @@ Always:
 """
 
 
+
 # -----------------------------
 # Student Selection
 # -----------------------------
@@ -299,15 +310,25 @@ selected_student = st.selectbox(
 
 
 # -----------------------------
-# Save Selected Student
+# Load Student Memory M5
 # -----------------------------
 
 if selected_student != st.session_state.student_id:
 
+
     st.session_state.student_id = selected_student
 
-    # Clear old conversation
+
+    # Clear old session chat
+
     st.session_state.messages = []
+
+
+    # Load previous memories from Mem0
+
+    st.session_state.student_memory = get_student_memory(
+        selected_student
+    )
 
 
 
@@ -317,27 +338,39 @@ if selected_student != st.session_state.student_id:
 
 agent = create_agent(
     model=model,
-    tools=[get_student_data,get_knowledge_data],
+    tools=[
+        get_student_data,
+        get_knowledge_data
+    ],
     system_prompt=SYSTEM_PROMPT,
     context_schema=StudentContext
 )
 
 
 
+# -----------------------------
+# UI
+# -----------------------------
+
+st.title(
+    "🎓 Student Success Coach"
+)
 
 
-st.title("🎓 Student Success Coach")
 
-
-
-# Display chat history
+# -----------------------------
+# Display Chat History
+# -----------------------------
 
 for message in st.session_state.messages:
 
-    with st.chat_message(message["role"]):
+    with st.chat_message(
+        message["role"]
+    ):
 
-        st.write(message["content"])
-
+        st.write(
+            message["content"]
+        )
 
 
 
@@ -345,7 +378,9 @@ for message in st.session_state.messages:
 # Chat Input
 # -----------------------------
 
-if prompt := st.chat_input("Ask your coach"):
+if prompt := st.chat_input(
+    "Ask your coach"
+):
 
 
     st.session_state.messages.append(
@@ -365,14 +400,51 @@ if prompt := st.chat_input("Ask your coach"):
     with st.chat_message("assistant"):
 
 
+
+        
+
+        memory_message = {
+            "role": "system",
+            "content": f"""
+Previous student memory:
+
+{st.session_state.student_memory}
+
+You are given previous student context to improve coaching quality.
+
+Use this information silently while responding.
+
+Rules:
+- Never mention that you have memory or previous sessions.
+- Never say "I remember", "you told me before", or similar phrases.
+- Never reveal private stored details unless the student asks about their own progress.
+- Use previous context only to make responses more relevant.
+- Apply the context in some cases when earning preferences , study habits,academic patterns are required .
+
+If the stored context is unrelated to the current question, ignore it.
+
+"""
+
+        }
+
+
+
         result = agent.invoke(
+
             {
-                "messages": st.session_state.messages
+                "messages": [
+                    memory_message
+                ]
+                +
+                st.session_state.messages
             },
+
+
             context={
                 "student_id": st.session_state.student_id
             }
         )
+
 
 
         reply = result["messages"][-1].content
@@ -388,13 +460,20 @@ if prompt := st.chat_input("Ask your coach"):
             "content": reply
         }
     )
+
+
+
 # -----------------------------
-# End Session
+# End Session - Save Memory
 # -----------------------------
 
-if st.button("End Session"):
+if st.button(
+    "End Session"
+):
+
 
     if st.session_state.messages:
+
 
         save_session_memory(
             st.session_state.student_id,
@@ -409,10 +488,13 @@ if st.button("End Session"):
 
         st.session_state.messages = []
 
+
         st.rerun()
 
 
+
     else:
+
 
         st.warning(
             "No conversation available to save."
