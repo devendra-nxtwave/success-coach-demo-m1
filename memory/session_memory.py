@@ -753,24 +753,23 @@ def mark_signal_resolved(signal_id):
 
     client = get_mem0_client()
 
+    resolved_at = datetime.now().isoformat()
+
 
     try:
 
-        # Preferred path: in-place metadata update, if supported
-        # by the installed mem0 SDK version.
-
         client.update(
             memory_id=signal_id,
-            metadata={"resolved": True}
+            metadata={
+                "resolved": True,
+                "resolved_at": resolved_at
+            }
         )
 
         return True
 
 
     except Exception:
-
-        # Fallback for mem0 versions where update() doesn't
-        # accept metadata directly - fetch, delete, re-add as resolved.
 
         try:
 
@@ -781,6 +780,7 @@ def mark_signal_resolved(signal_id):
             user_id = existing.get("user_id")
 
             metadata["resolved"] = True
+            metadata["resolved_at"] = resolved_at
 
             client.delete(signal_id)
 
@@ -1147,3 +1147,168 @@ Detected At:
         pass
 
     return None
+
+# ==================================================
+# M8: GET LAST COACH MEETING TIMESTAMP
+
+# ==================================================
+
+def get_last_meeting_timestamp(student_id):
+
+    client = get_mem0_client()
+
+    result = client.get_all(
+
+        filters={
+
+            "AND": [
+
+                {"user_id": student_id},
+
+                {"metadata": {"memory_type": "student_signal"}}
+
+            ]
+
+        }
+
+    )
+
+    if isinstance(result, dict):
+        raw_signals = result.get("results", [])
+    else:
+        raw_signals = result
+
+
+    meeting_timestamps = []
+
+    for item in raw_signals:
+
+        metadata = item.get("metadata", {})
+
+        if metadata.get("resolved"):
+
+            # resolved_at = when the meeting happened
+            # fall back to timestamp only for old records that
+            # predate this field
+
+            ts = metadata.get("resolved_at") or metadata.get("timestamp")
+
+            if ts:
+                meeting_timestamps.append(ts)
+
+
+    if not meeting_timestamps:
+        return None
+
+    meeting_timestamps.sort(reverse=True)
+
+    return meeting_timestamps[0]
+def generate_student_brief(student_id, academic_data):
+
+    memory = get_student_memory(student_id)
+
+    open_signals_data = get_all_signals([student_id])
+
+    open_signals = open_signals_data[0]["signals"] if open_signals_data else []
+
+    last_meeting_at = get_last_meeting_timestamp(student_id)
+
+
+    # Only keep session summaries that happened AFTER the last
+    # coach meeting - these represent what's new since then.
+    # If there's no last meeting, keep everything (first-ever brief).
+
+    all_sessions = memory.get("session_summary", [])
+
+    if last_meeting_at:
+
+        sessions_since_last_meeting = [
+            s for s in all_sessions
+            if s.get("timestamp") and s["timestamp"] > last_meeting_at
+        ]
+
+    else:
+
+        sessions_since_last_meeting = all_sessions
+
+
+    today_str = datetime.now().strftime("%Y-%m-%d (%A)")
+
+    payload = json.dumps(
+        {
+            "academic_data": academic_data,
+            "factual_memory": memory.get("factual_memory"),
+            "last_meeting_at": last_meeting_at,
+            "session_summaries_since_last_meeting": sessions_since_last_meeting,
+            "open_signals": open_signals
+        },
+        default=str
+    )
+
+
+    response = summary_model.invoke(
+
+        f"""
+
+You are preparing a student success coach for an upcoming 1-on-1 meeting.
+
+Today's date is: {today_str}
+
+"last_meeting_at" tells you exactly when the coach last had a real
+meeting with this student (or null if they've never met).
+
+"session_summaries_since_last_meeting" contains ONLY the student's AI
+chat sessions that happened after that last meeting - this is genuinely
+new information the coach hasn't seen yet. If last_meeting_at is null,
+this contains their entire chat history instead, since there's no prior
+meeting to compare against.
+
+"factual_memory" contains long-term facts about this student - study
+habits, stress triggers, recurring patterns - collected over all time,
+not limited to any date range. Always consider all of it, it's
+foundational context regardless of when it was learned.
+
+"open_signals" contains every currently UNRESOLVED concern for this
+student, regardless of when each was flagged - each has its own
+timestamp.
+
+Data:
+{payload}
+
+Write a short, focused pre-meeting brief with these sections:
+
+1. CURRENT SITUATION - one or two sentences on where this student stands
+   right now academically (recent scores, attendance trend, upcoming
+   exams). Be specific with numbers if available.
+
+2. WHAT'S CHANGED SINCE LAST MEETING - state how long ago the last
+   coach meeting was (using last_meeting_at vs today). Then summarize
+   what's new based ONLY on session_summaries_since_last_meeting and
+   current academic data - do not reference anything from before that
+   meeting. If last_meeting_at is null, say the coach has not met with
+   this student yet, and briefly summarize their chat history instead.
+
+3. OPEN CONCERNS - list every entry in open_signals in plain language,
+   with how long ago each was flagged (using each signal's own timestamp
+   vs today). If open_signals is empty, say there are no open concerns
+   right now.
+
+4. CONVERSATION STARTERS - 2-3 specific, natural questions or talking
+   points the coach could open with today, grounded in the actual data
+   above - factual memory, open concerns, and what's new since the last
+   meeting.
+
+Rules:
+- Be concise - this is a quick brief before a meeting, not a report.
+- Do not invent facts not present in the data.
+- Never state a time gap vaguely - always calculate it from the actual
+  timestamp against today's date.
+- If a section has nothing relevant, say so briefly rather than padding.
+- Write in plain, direct language a busy coach can skim in under a minute.
+
+"""
+
+    )
+
+
+    return response.content

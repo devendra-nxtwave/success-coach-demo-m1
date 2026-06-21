@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
+
+
 from memory.session_memory import (
     save_session_memory,
     get_student_memory,
@@ -15,7 +17,8 @@ from memory.session_memory import (
     generate_daily_plan,
     mark_signal_resolved,
     mark_all_signals_resolved,
-    log_completed_checkin
+    log_completed_checkin,
+    generate_student_brief
 )
 
 from calendar_client import create_calendar_event
@@ -71,7 +74,8 @@ if "daily_plan" not in st.session_state:
 from student_data import (
     get_student_ids,
     get_student_data,
-    get_student_roster
+    get_student_roster,
+    get_student_academic_data
 )
 
 from knowledge_data import (
@@ -556,7 +560,39 @@ else:
         value=6
     )
 
+    # -----------------------------
+    # M8: Standalone Brief Request (any student)
+    # -----------------------------
 
+    st.subheader("Pre-Meeting Brief")
+
+    roster_for_brief = get_student_roster()
+
+    brief_student = st.selectbox(
+        "Get a brief for any student",
+        [row["student_id"] for row in roster_for_brief],
+        key="brief_student_select"
+    )
+
+    if st.button("Get Brief"):
+
+        academic_data = get_student_academic_data(brief_student)
+
+        brief = generate_student_brief(brief_student, academic_data)
+
+        st.session_state.current_brief = {
+            "student_id": brief_student,
+            "text": brief
+        }
+
+
+    if st.session_state.get("current_brief"):
+
+        with st.expander(
+            f"📄 Brief — {st.session_state.current_brief['student_id']}",
+            expanded=True
+        ):
+            st.markdown(st.session_state.current_brief["text"])
     # M7: track which signals were marked done in this session
     # so the UI reflects it immediately without regenerating the plan
 
@@ -622,6 +658,20 @@ else:
 
             with col2:
 
+                if st.button("View Brief", key=f"brief_{entry['student_id']}"):
+
+                    academic_data = get_student_academic_data(entry["student_id"])
+
+                    brief = generate_student_brief(entry["student_id"], academic_data)
+
+                    st.session_state.current_brief = {
+                        "student_id": entry["student_id"],
+                        "text": brief
+                    }
+
+                    st.rerun()
+
+
                 if is_done:
 
                     st.markdown("✅ **Done**")
@@ -632,6 +682,7 @@ else:
                         "Mark Completed",
                         key=f"resolve_{tracking_key}"
                     ):
+                        
 
                         if signal_id:
 

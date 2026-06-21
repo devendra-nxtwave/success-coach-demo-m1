@@ -154,3 +154,44 @@ def get_student_data(runtime: ToolRuntime):
         "attendance": student_attendance,
         "exams": student_exams
     }
+
+def get_student_academic_data(student_id):
+
+    client = connect_google_sheet()
+
+    spreadsheet = client.open_by_key(
+        get_secret("GOOGLE_SHEET_ID")
+    )
+
+    roster = spreadsheet.worksheet("roster").get_all_records()
+
+    student_info = next(
+        (row for row in roster if row["student_id"] == student_id),
+        None
+    )
+
+    scores = spreadsheet.worksheet("exam_scores").get_all_records()
+
+    student_scores = [
+        row for row in scores if row["student_id"] == student_id
+    ]
+
+    attendance = spreadsheet.worksheet("attendance").get_all_records()
+
+    student_attendance = [
+        row for row in attendance if row["student_id"] == student_id
+    ]
+
+    exams = spreadsheet.worksheet("exam_schedule").get_all_records()
+
+    student_exams = [
+        row for row in exams if row["student_id"] == student_id
+    ]
+
+    return {
+        "student_id": student_id,
+        "student_name": student_info.get("name", "Unknown") if student_info else "Unknown",
+        "scores": student_scores,
+        "attendance": student_attendance,
+        "exams": student_exams
+    }
