@@ -1,28 +1,64 @@
 from langchain.tools import tool
 import streamlit as st
 
+import os
+from dotenv import load_dotenv
+
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 
 
-embeddings = OpenAIEmbeddings(
-    model="text-embedding-3-small",
-    api_key=st.secrets["OPENAI_API_KEY"]
-)
+# -----------------------------
+# Load Environment
+# -----------------------------
+
+load_dotenv()
 
 
-vectorstore = Chroma(
-    collection_name="course_material",
-    embedding_function=embeddings,
-    chroma_cloud_api_key=st.secrets["CHROMA_API_KEY"],
-    tenant=st.secrets["CHROMA_TENANT"],
-    database=st.secrets["CHROMA_DATABASE"]
-)
+def get_secret(key):
+
+    value = os.getenv(key)
+
+    if value:
+        return value
+
+    return st.secrets[key]
 
 
+
+# -----------------------------
+# Create Vector Store
+# -----------------------------
+
+@st.cache_resource
+def get_vectorstore():
+
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        api_key=get_secret("OPENAI_API_KEY")
+    )
+
+
+    return Chroma(
+        collection_name="course_material",
+        embedding_function=embeddings,
+        chroma_cloud_api_key=get_secret("CHROMA_API_KEY"),
+        tenant=get_secret("CHROMA_TENANT"),
+        database=get_secret("CHROMA_DATABASE")
+    )
+
+
+
+vectorstore = get_vectorstore()
+
+
+
+# -----------------------------
+# Knowledge Base Tool
+# -----------------------------
 
 @tool
-def get_knowledge_data(question:str):
+def get_knowledge_data(question: str):
 
     """
     Retrieve information from the student's course material.
@@ -45,8 +81,7 @@ def get_knowledge_data(question:str):
     if not docs:
 
         return {
-            "context":
-            "No relevant course material found."
+            "context": "No relevant course material found."
         }
 
 
@@ -54,11 +89,11 @@ def get_knowledge_data(question:str):
     return {
 
         "context":
-        "\n\n".join(
-            [
-                doc.page_content
-                for doc in docs
-            ]
-        )
+            "\n\n".join(
+                [
+                    doc.page_content
+                    for doc in docs
+                ]
+            )
 
     }

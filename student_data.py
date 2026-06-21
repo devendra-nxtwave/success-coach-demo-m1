@@ -1,14 +1,40 @@
 import os
+import json
 import streamlit as st
 import gspread
 
+from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from langchain.tools import tool, ToolRuntime
+
+
+# -----------------------------
+# Load Environment
+# -----------------------------
+
+load_dotenv()
 
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly"
 ]
+
+
+# -----------------------------
+# Get Config
+# Local -> .env
+# Cloud -> st.secrets
+# -----------------------------
+
+def get_secret(key):
+
+    value = os.getenv(key)
+
+    if value:
+        return value
+
+    return st.secrets[key]
+
 
 
 # -----------------------------
@@ -18,12 +44,37 @@ SCOPES = [
 @st.cache_resource
 def connect_google_sheet():
 
+    # Local (.env)
+    google_credentials = os.getenv(
+        "GOOGLE_CREDENTIALS"
+    )
+
+
+    if google_credentials:
+
+        credentials = json.loads(
+            google_credentials
+        )
+
+
+    # Streamlit Cloud
+    else:
+
+        credentials = dict(
+            st.secrets["google_credentials"]
+        )
+
+
     creds = Credentials.from_service_account_info(
-        st.secrets["google_credentials"],
+        credentials,
         scopes=SCOPES
     )
 
-    client = gspread.authorize(creds)
+
+    client = gspread.authorize(
+        creds
+    )
+
 
     return client
 
@@ -37,8 +88,9 @@ def get_student_ids():
 
     client = connect_google_sheet()
 
+
     spreadsheet = client.open_by_key(
-        st.secrets["GOOGLE_SHEET_ID"]
+        get_secret("GOOGLE_SHEET_ID")
     )
 
 
@@ -50,13 +102,10 @@ def get_student_ids():
     records = roster_sheet.get_all_records()
 
 
-    student_ids = [
+    return [
         row["student_id"]
         for row in records
     ]
-
-
-    return student_ids
 
 
 
@@ -68,11 +117,9 @@ def get_student_ids():
 def get_student_data(runtime: ToolRuntime):
 
     """
-    Fetch selected student's academic data
-    from this tool.
+    Fetch selected student's academic data.
     """
 
-    # Get selected student from application context
 
     student_id = runtime.context["student_id"]
 
@@ -81,13 +128,11 @@ def get_student_data(runtime: ToolRuntime):
 
 
     spreadsheet = client.open_by_key(
-        st.secrets["GOOGLE_SHEET_ID"]
+        get_secret("GOOGLE_SHEET_ID")
     )
 
 
-    # -----------------------------
     # Roster
-    # -----------------------------
 
     roster = spreadsheet.worksheet(
         "roster"
@@ -104,10 +149,7 @@ def get_student_data(runtime: ToolRuntime):
     )
 
 
-
-    # -----------------------------
     # Scores
-    # -----------------------------
 
     scores = spreadsheet.worksheet(
         "exam_scores"
@@ -122,9 +164,7 @@ def get_student_data(runtime: ToolRuntime):
 
 
 
-    # -----------------------------
     # Attendance
-    # -----------------------------
 
     attendance = spreadsheet.worksheet(
         "attendance"
@@ -139,9 +179,7 @@ def get_student_data(runtime: ToolRuntime):
 
 
 
-    # -----------------------------
     # Exams
-    # -----------------------------
 
     exams = spreadsheet.worksheet(
         "exam_schedule"
@@ -156,16 +194,15 @@ def get_student_data(runtime: ToolRuntime):
 
 
 
-    # -----------------------------
-    # Return Data
-    # -----------------------------
-
     return {
 
         "student_id": student_id,
 
         "student_name":
-            student_info["name"]
+            student_info.get(
+                "name",
+                "Unknown"
+            )
             if student_info
             else "Unknown",
 

@@ -6,6 +6,7 @@ from typing import TypedDict
 
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
+from memory.session_memory import save_session_memory
 
 
 # -----------------------------
@@ -61,7 +62,10 @@ from knowledge_data import (
 
 model = ChatOpenAI(
     model="gpt-5.4-mini-2026-03-17",
-    api_key=os.getenv("OPENAI_API_KEY")
+    api_key=(
+        os.getenv("OPENAI_API_KEY")
+        or st.secrets["OPENAI_API_KEY"]
+    )
 )
 
 
@@ -336,6 +340,7 @@ for message in st.session_state.messages:
 
 
 
+
 # -----------------------------
 # Chat Input
 # -----------------------------
@@ -383,3 +388,32 @@ if prompt := st.chat_input("Ask your coach"):
             "content": reply
         }
     )
+# -----------------------------
+# End Session
+# -----------------------------
+
+if st.button("End Session"):
+
+    if st.session_state.messages:
+
+        save_session_memory(
+            st.session_state.student_id,
+            st.session_state.messages
+        )
+
+
+        st.success(
+            "Your session has been saved."
+        )
+
+
+        st.session_state.messages = []
+
+        st.rerun()
+
+
+    else:
+
+        st.warning(
+            "No conversation available to save."
+        )

@@ -9,4 +9,5 @@ langchain-chroma
 langchain-text-splitters
 chromadb
 protobuf==5.29.5
+mem0ai
 
