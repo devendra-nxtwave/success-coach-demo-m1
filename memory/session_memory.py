@@ -925,8 +925,7 @@ STEP 2: Rank students and fill today's schedule
 
 - Sort all students by priority level (their worst unresolved signal),
   highest concern first.
-- Each student appears AT MOST ONCE in the entire plan (today or tomorrow
-  combined), even if they have multiple unresolved signals. Pick their
+- Each student appears AT MOST ONCE in the entire plan , even if they have multiple unresolved signals. Pick their
   single worst signal to justify the one session - do not create separate
   entries for the same student's different signals.
 - Fill up to {max_sessions_today} "today" slots starting from the highest

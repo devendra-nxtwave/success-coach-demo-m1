@@ -560,30 +560,7 @@ else:
         value=6
     )
 
-    # -----------------------------
-    # M8: Standalone Brief Request (any student)
-    # -----------------------------
-
-    st.subheader("Pre-Meeting Brief")
-
-    roster_for_brief = get_student_roster()
-
-    brief_student = st.selectbox(
-        "Get a brief for any student",
-        [row["student_id"] for row in roster_for_brief],
-        key="brief_student_select"
-    )
-
-    if st.button("Get Brief"):
-
-        academic_data = get_student_academic_data(brief_student)
-
-        brief = generate_student_brief(brief_student, academic_data)
-
-        st.session_state.current_brief = {
-            "student_id": brief_student,
-            "text": brief
-        }
+    
 
 
     if st.session_state.get("current_brief"):
