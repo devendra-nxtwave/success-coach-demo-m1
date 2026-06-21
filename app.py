@@ -3,14 +3,22 @@ import streamlit as st
 
 from dotenv import load_dotenv
 from typing import TypedDict
+from datetime import datetime, timedelta
 
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
 from memory.session_memory import (
     save_session_memory,
-    get_student_memory
+    get_student_memory,
+    get_all_signals,
+    generate_daily_plan,
+    mark_signal_resolved,
+    mark_all_signals_resolved,
+    log_completed_checkin
 )
+
+from calendar_client import create_calendar_event
 
 
 # -----------------------------
@@ -49,6 +57,12 @@ if "student_memory" not in st.session_state:
     st.session_state.student_memory = []
 
 
+# M7 Coach State
+
+if "daily_plan" not in st.session_state:
+    st.session_state.daily_plan = None
+
+
 
 # -----------------------------
 # Import Student Tools
@@ -56,7 +70,8 @@ if "student_memory" not in st.session_state:
 
 from student_data import (
     get_student_ids,
-    get_student_data
+    get_student_data,
+    get_student_roster
 )
 
 from knowledge_data import (
@@ -297,206 +312,407 @@ Always:
 
 
 # -----------------------------
-# Student Selection
+# View Switch (M7)
 # -----------------------------
 
-student_ids = get_student_ids()
-
-
-selected_student = st.selectbox(
-    "Select Student ID",
-    student_ids
+view = st.radio(
+    "View",
+    ["Student", "Coach"],
+    horizontal=True
 )
 
 
 
-# -----------------------------
-# Load Student Memory M5
-# -----------------------------
+# ==================================================
+# STUDENT VIEW (M1 - M6, unchanged)
+# ==================================================
 
-if selected_student != st.session_state.student_id:
-
-
-    st.session_state.student_id = selected_student
+if view == "Student":
 
 
-    # Clear old session chat
+    # -----------------------------
+    # Student Selection
+    # -----------------------------
 
-    st.session_state.messages = []
+    student_ids = get_student_ids()
 
 
-    # Load previous memories from Mem0
-
-    st.session_state.student_memory = get_student_memory(
-        selected_student
+    selected_student = st.selectbox(
+        "Select Student ID",
+        student_ids
     )
 
 
 
-# -----------------------------
-# Create Agent
-# -----------------------------
+    # -----------------------------
+    # Load Student Memory M5
+    # -----------------------------
 
-agent = create_agent(
-    model=model,
-    tools=[
-        get_student_data,
-        get_knowledge_data
-    ],
-    system_prompt=SYSTEM_PROMPT,
-    context_schema=StudentContext
-)
+    if selected_student != st.session_state.student_id:
 
 
-
-# -----------------------------
-# UI
-# -----------------------------
-
-st.title(
-    "🎓 Student Success Coach"
-)
+        st.session_state.student_id = selected_student
 
 
+        # Clear old session chat
 
-# -----------------------------
-# Display Chat History
-# -----------------------------
+        st.session_state.messages = []
 
-for message in st.session_state.messages:
 
-    with st.chat_message(
-        message["role"]
-    ):
+        # Load previous memories from Mem0
 
-        st.write(
-            message["content"]
+        st.session_state.student_memory = get_student_memory(
+            selected_student
         )
 
 
 
-# -----------------------------
-# Chat Input
-# -----------------------------
+    # -----------------------------
+    # Create Agent
+    # -----------------------------
 
-if prompt := st.chat_input(
-    "Ask your coach"
-):
-
-
-    st.session_state.messages.append(
-        {
-            "role": "user",
-            "content": prompt
-        }
+    agent = create_agent(
+        model=model,
+        tools=[
+            get_student_data,
+            get_knowledge_data
+        ],
+        system_prompt=SYSTEM_PROMPT,
+        context_schema=StudentContext
     )
 
 
-    with st.chat_message("user"):
 
-        st.write(prompt)
+    # -----------------------------
+    # UI
+    # -----------------------------
 
-
-
-    with st.chat_message("assistant"):
-
-
-
-        
-
-        memory_message = {
-            "role": "system",
-            "content": f"""
-Previous student memory:
-
-{st.session_state.student_memory}
-
-You are given previous student context to improve coaching quality.
-
-Use this information silently while responding.
-
-Rules:
-- Never mention that you have memory or previous sessions.
-- Never say "I remember", "you told me before", or similar phrases.
-- Never reveal private stored details unless the student asks about their own progress.
-- Use previous context only to make responses more relevant.
-- Apply the context in some cases when earning preferences , study habits,academic patterns are required .
-
-If the stored context is unrelated to the current question, ignore it.
-
-"""
-
-        }
+    st.title(
+        "🎓 Student Success Coach"
+    )
 
 
 
-        result = agent.invoke(
+    # -----------------------------
+    # Display Chat History
+    # -----------------------------
 
+    for message in st.session_state.messages:
+
+        with st.chat_message(
+            message["role"]
+        ):
+
+            st.write(
+                message["content"]
+            )
+
+
+
+    # -----------------------------
+    # Chat Input
+    # -----------------------------
+
+    if prompt := st.chat_input(
+        "Ask your coach"
+    ):
+
+
+        st.session_state.messages.append(
             {
-                "messages": [
-                    memory_message
-                ]
-                +
-                st.session_state.messages
-            },
+                "role": "user",
+                "content": prompt
+            }
+        )
 
 
-            context={
-                "student_id": st.session_state.student_id
+        with st.chat_message("user"):
+
+            st.write(prompt)
+
+
+
+        with st.chat_message("assistant"):
+
+
+
+
+            memory_message = {
+                "role": "system",
+                "content": f"""
+    Previous student memory:
+
+    {st.session_state.student_memory}
+
+    You are given previous student context to improve coaching quality.
+
+    Use this information silently while responding.
+
+    Rules:
+    - Never mention that you have memory or previous sessions.
+    - Never say "I remember", "you told me before", or similar phrases.
+    - Never reveal private stored details unless the student asks about their own progress.
+    - Use previous context only to make responses more relevant.
+    - Apply the context in some cases when earning preferences , study habits,academic patterns are required .
+
+    If the stored context is unrelated to the current question, ignore it.
+
+    """
+
+            }
+
+
+
+            result = agent.invoke(
+
+                {
+                    "messages": [
+                        memory_message
+                    ]
+                    +
+                    st.session_state.messages
+                },
+
+
+                context={
+                    "student_id": st.session_state.student_id
+                }
+            )
+
+
+
+            reply = result["messages"][-1].content
+
+
+            st.write(reply)
+
+
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": reply
             }
         )
 
 
 
-        reply = result["messages"][-1].content
+    # -----------------------------
+    # End Session - Save Memory
+    # -----------------------------
+
+    if st.button(
+        "End Session"
+    ):
 
 
-        st.write(reply)
+        if st.session_state.messages:
+
+
+            save_session_memory(
+                st.session_state.student_id,
+                st.session_state.messages
+            )
+
+
+            st.success(
+                "Your session has been saved."
+            )
+
+
+            st.session_state.messages = []
+
+
+            st.rerun()
 
 
 
-    st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": reply
-        }
+        else:
+
+
+            st.warning(
+                "No conversation available to save."
+            )
+
+
+
+# ==================================================
+# COACH VIEW (M7 - new)
+# ==================================================
+
+
+
+else:
+
+    st.title(
+        "📋 Coach Dashboard"
     )
 
 
-
-# -----------------------------
-# End Session - Save Memory
-# -----------------------------
-
-if st.button(
-    "End Session"
-):
+    max_sessions = st.number_input(
+        "Sessions coach can fit today",
+        min_value=1,
+        max_value=15,
+        value=6
+    )
 
 
-    if st.session_state.messages:
+    # M7: track which signals were marked done in this session
+    # so the UI reflects it immediately without regenerating the plan
+
+    if "resolved_today" not in st.session_state:
+        st.session_state.resolved_today = set()
 
 
-        save_session_memory(
-            st.session_state.student_id,
-            st.session_state.messages
+    if st.button("Generate Daily Plan"):
+
+        roster = get_student_roster()
+
+        student_ids = [
+            row["student_id"] for row in roster
+        ]
+
+        signals = get_all_signals(student_ids)
+
+        plan = generate_daily_plan(
+            signals,
+            roster,
+            max_sessions_today=max_sessions
+        )
+
+        st.session_state.daily_plan = plan
+
+        # reset resolved tracking for the new plan
+        st.session_state.resolved_today = set()
+
+
+
+    plan = st.session_state.daily_plan
+
+
+    if plan:
+
+
+        st.subheader("Today")
+
+        for entry in plan.get("today", []):
+
+            col1, col2 = st.columns([4, 1])
+
+            session_type = entry.get("session_type") or "check_in"
+
+            signal_id = entry.get("signal_id")
+
+            # use student_id as the tracking key when there's no signal_id,
+            # so each no-signal entry can still be marked done independently
+
+            tracking_key = signal_id or f"checkin_{entry['student_id']}"
+
+            is_done = tracking_key in st.session_state.resolved_today
+
+
+            with col1:
+
+                status = " ✅ Done" if is_done else ""
+
+                st.markdown(
+                    f"**{entry['student_name']}** — {session_type.replace('_', ' ').title()}{status}  \n"
+                    f"_{entry['reason']}_"
+                )
+
+            with col2:
+
+                if is_done:
+
+                    st.markdown("✅ **Done**")
+
+                else:
+
+                    if st.button(
+                        "Mark Completed",
+                        key=f"resolve_{tracking_key}"
+                    ):
+
+                        if signal_id:
+
+                            # one meeting closes ALL open signals
+                            # for this student, not just this one
+                            mark_all_signals_resolved(entry["student_id"])
+
+                        else:
+
+                            log_completed_checkin(
+                                entry["student_id"],
+                                session_type,
+                                entry["reason"]
+                            )
+
+                        st.session_state.resolved_today.add(tracking_key)
+
+                        st.rerun()
+
+                        
+
+
+
+        st.subheader("Deferred to Tomorrow")
+
+        for entry in plan.get("tomorrow", []):
+
+            st.markdown(
+                f"**{entry['student_name']}** — {entry['reason']}"
+            )
+
+
+
+        # -----------------------------
+        # Calendar Invite Scheduling
+        # -----------------------------
+
+        st.subheader("Schedule Calendar Invites")
+
+        start_time_input = st.time_input(
+            "Start time for today's sessions",
+            value=datetime.now().replace(
+                hour=10, minute=0, second=0, microsecond=0
+            ).time()
+        )
+
+        session_length = st.number_input(
+            "Session length (minutes)",
+            min_value=10,
+            max_value=120,
+            value=30,
+            step=5
         )
 
 
-        st.success(
-            "Your session has been saved."
-        )
+        if plan.get("today") and st.button("Create Calendar Invites for Today"):
 
+            start_time = datetime.now().replace(
+                hour=start_time_input.hour,
+                minute=start_time_input.minute,
+                second=0,
+                microsecond=0
+            )
 
-        st.session_state.messages = []
+            created = 0
 
+            for entry in plan["today"]:
 
-        st.rerun()
+                end_time = start_time + timedelta(minutes=session_length)
 
+                session_type = entry.get("session_type") or "check_in"
 
+                create_calendar_event(
+                    summary=f"{session_type.replace('_', ' ').title()} — {entry['student_name']}",
+                    description=entry["reason"],
+                    start_dt=start_time,
+                    end_dt=end_time
+                )
 
-    else:
+                start_time = end_time
 
+                created += 1
 
-        st.warning(
-            "No conversation available to save."
-        )
+            st.success(f"Created {created} calendar invites starting at {start_time_input.strftime('%I:%M %p')}.")

@@ -14,7 +14,6 @@ from langchain.tools import tool, ToolRuntime
 
 load_dotenv()
 
-
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly"
 ]
@@ -36,7 +35,6 @@ def get_secret(key):
     return st.secrets[key]
 
 
-
 # -----------------------------
 # Connect Google Sheets
 # -----------------------------
@@ -45,39 +43,23 @@ def get_secret(key):
 def connect_google_sheet():
 
     # Local (.env)
-    google_credentials = os.getenv(
-        "GOOGLE_CREDENTIALS"
-    )
-
+    google_credentials = os.getenv("GOOGLE_CREDENTIALS")
 
     if google_credentials:
-
-        credentials = json.loads(
-            google_credentials
-        )
-
+        credentials = json.loads(google_credentials)
 
     # Streamlit Cloud
     else:
-
-        credentials = dict(
-            st.secrets["google_credentials"]
-        )
-
+        credentials = dict(st.secrets["google_credentials"])
 
     creds = Credentials.from_service_account_info(
         credentials,
         scopes=SCOPES
     )
 
-
-    client = gspread.authorize(
-        creds
-    )
-
+    client = gspread.authorize(creds)
 
     return client
-
 
 
 # -----------------------------
@@ -88,25 +70,34 @@ def get_student_ids():
 
     client = connect_google_sheet()
 
+    spreadsheet = client.open_by_key(
+        get_secret("GOOGLE_SHEET_ID")
+    )
+
+    roster_sheet = spreadsheet.worksheet("roster")
+
+    records = roster_sheet.get_all_records()
+
+    return [row["student_id"] for row in records]
+
+
+# -----------------------------
+# Get Full Student Roster (M7)
+# Used by coach view to list all students
+# for daily plan generation.
+# -----------------------------
+
+def get_student_roster():
+
+    client = connect_google_sheet()
 
     spreadsheet = client.open_by_key(
         get_secret("GOOGLE_SHEET_ID")
     )
 
+    roster_sheet = spreadsheet.worksheet("roster")
 
-    roster_sheet = spreadsheet.worksheet(
-        "roster"
-    )
-
-
-    records = roster_sheet.get_all_records()
-
-
-    return [
-        row["student_id"]
-        for row in records
-    ]
-
+    return roster_sheet.get_all_records()
 
 
 # -----------------------------
@@ -115,100 +106,51 @@ def get_student_ids():
 
 @tool
 def get_student_data(runtime: ToolRuntime):
-
     """
     Fetch selected student's academic data.
     """
 
-
     student_id = runtime.context["student_id"]
 
-
     client = connect_google_sheet()
-
 
     spreadsheet = client.open_by_key(
         get_secret("GOOGLE_SHEET_ID")
     )
 
-
     # Roster
-
-    roster = spreadsheet.worksheet(
-        "roster"
-    ).get_all_records()
-
+    roster = spreadsheet.worksheet("roster").get_all_records()
 
     student_info = next(
-        (
-            row
-            for row in roster
-            if row["student_id"] == student_id
-        ),
+        (row for row in roster if row["student_id"] == student_id),
         None
     )
 
-
     # Scores
-
-    scores = spreadsheet.worksheet(
-        "exam_scores"
-    ).get_all_records()
-
+    scores = spreadsheet.worksheet("exam_scores").get_all_records()
 
     student_scores = [
-        row
-        for row in scores
-        if row["student_id"] == student_id
+        row for row in scores if row["student_id"] == student_id
     ]
-
-
 
     # Attendance
-
-    attendance = spreadsheet.worksheet(
-        "attendance"
-    ).get_all_records()
-
+    attendance = spreadsheet.worksheet("attendance").get_all_records()
 
     student_attendance = [
-        row
-        for row in attendance
-        if row["student_id"] == student_id
+        row for row in attendance if row["student_id"] == student_id
     ]
-
-
 
     # Exams
-
-    exams = spreadsheet.worksheet(
-        "exam_schedule"
-    ).get_all_records()
-
+    exams = spreadsheet.worksheet("exam_schedule").get_all_records()
 
     student_exams = [
-        row
-        for row in exams
-        if row["student_id"] == student_id
+        row for row in exams if row["student_id"] == student_id
     ]
 
-
-
     return {
-
         "student_id": student_id,
-
-        "student_name":
-            student_info.get(
-                "name",
-                "Unknown"
-            )
-            if student_info
-            else "Unknown",
-
+        "student_name": student_info.get("name", "Unknown") if student_info else "Unknown",
         "scores": student_scores,
-
         "attendance": student_attendance,
-
         "exams": student_exams
     }
