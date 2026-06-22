@@ -63,6 +63,39 @@ def connect_google_sheet():
 
 
 # -----------------------------
+# BUGFIX: safe worksheet reader, used by every lookup below.
+#
+# Two problems this guards against:
+#
+# 1. A missing or renamed tab (gspread.WorksheetNotFound) used to
+#    crash the whole chat turn, or the coach's "Generate Daily Plan" /
+#    "View Brief" actions, instead of degrading gracefully.
+#
+# 2. Trailing blank rows in a Google Sheet come back from
+#    get_all_records() as dicts where every value - including
+#    student_id - is an empty string, not a missing key. So
+#    row["student_id"] never raised an error, it just silently
+#    returned "". That let blank rows leak into the student picker
+#    dropdown, the roster used for daily planning, etc. Filtering on
+#    a non-empty student_id here stops that at the source.
+# -----------------------------
+
+def _safe_get_records(spreadsheet, worksheet_name):
+
+    try:
+        worksheet = spreadsheet.worksheet(worksheet_name)
+        records = worksheet.get_all_records()
+
+    except Exception:
+        return []
+
+    return [
+        row for row in records
+        if str(row.get("student_id", "")).strip()
+    ]
+
+
+# -----------------------------
 # Get Student IDs
 # -----------------------------
 
@@ -74,9 +107,7 @@ def get_student_ids():
         get_secret("GOOGLE_SHEET_ID")
     )
 
-    roster_sheet = spreadsheet.worksheet("roster")
-
-    records = roster_sheet.get_all_records()
+    records = _safe_get_records(spreadsheet, "roster")
 
     return [row["student_id"] for row in records]
 
@@ -95,9 +126,51 @@ def get_student_roster():
         get_secret("GOOGLE_SHEET_ID")
     )
 
-    roster_sheet = spreadsheet.worksheet("roster")
+    return _safe_get_records(spreadsheet, "roster")
 
-    return roster_sheet.get_all_records()
+
+
+
+def _fetch_student_academic_data(student_id):
+
+    client = connect_google_sheet()
+
+    spreadsheet = client.open_by_key(
+        get_secret("GOOGLE_SHEET_ID")
+    )
+
+    roster = _safe_get_records(spreadsheet, "roster")
+
+    student_info = next(
+        (row for row in roster if row["student_id"] == student_id),
+        None
+    )
+
+    scores = _safe_get_records(spreadsheet, "exam_scores")
+
+    student_scores = [
+        row for row in scores if row["student_id"] == student_id
+    ]
+
+    attendance = _safe_get_records(spreadsheet, "attendance")
+
+    student_attendance = [
+        row for row in attendance if row["student_id"] == student_id
+    ]
+
+    exams = _safe_get_records(spreadsheet, "exam_schedule")
+
+    student_exams = [
+        row for row in exams if row["student_id"] == student_id
+    ]
+
+    return {
+        "student_id": student_id,
+        "student_name": student_info.get("name", "Unknown") if student_info else "Unknown",
+        "scores": student_scores,
+        "attendance": student_attendance,
+        "exams": student_exams
+    }
 
 
 # -----------------------------
@@ -112,86 +185,9 @@ def get_student_data(runtime: ToolRuntime):
 
     student_id = runtime.context["student_id"]
 
-    client = connect_google_sheet()
+    return _fetch_student_academic_data(student_id)
 
-    spreadsheet = client.open_by_key(
-        get_secret("GOOGLE_SHEET_ID")
-    )
-
-    # Roster
-    roster = spreadsheet.worksheet("roster").get_all_records()
-
-    student_info = next(
-        (row for row in roster if row["student_id"] == student_id),
-        None
-    )
-
-    # Scores
-    scores = spreadsheet.worksheet("exam_scores").get_all_records()
-
-    student_scores = [
-        row for row in scores if row["student_id"] == student_id
-    ]
-
-    # Attendance
-    attendance = spreadsheet.worksheet("attendance").get_all_records()
-
-    student_attendance = [
-        row for row in attendance if row["student_id"] == student_id
-    ]
-
-    # Exams
-    exams = spreadsheet.worksheet("exam_schedule").get_all_records()
-
-    student_exams = [
-        row for row in exams if row["student_id"] == student_id
-    ]
-
-    return {
-        "student_id": student_id,
-        "student_name": student_info.get("name", "Unknown") if student_info else "Unknown",
-        "scores": student_scores,
-        "attendance": student_attendance,
-        "exams": student_exams
-    }
 
 def get_student_academic_data(student_id):
 
-    client = connect_google_sheet()
-
-    spreadsheet = client.open_by_key(
-        get_secret("GOOGLE_SHEET_ID")
-    )
-
-    roster = spreadsheet.worksheet("roster").get_all_records()
-
-    student_info = next(
-        (row for row in roster if row["student_id"] == student_id),
-        None
-    )
-
-    scores = spreadsheet.worksheet("exam_scores").get_all_records()
-
-    student_scores = [
-        row for row in scores if row["student_id"] == student_id
-    ]
-
-    attendance = spreadsheet.worksheet("attendance").get_all_records()
-
-    student_attendance = [
-        row for row in attendance if row["student_id"] == student_id
-    ]
-
-    exams = spreadsheet.worksheet("exam_schedule").get_all_records()
-
-    student_exams = [
-        row for row in exams if row["student_id"] == student_id
-    ]
-
-    return {
-        "student_id": student_id,
-        "student_name": student_info.get("name", "Unknown") if student_info else "Unknown",
-        "scores": student_scores,
-        "attendance": student_attendance,
-        "exams": student_exams
-    }
+    return _fetch_student_academic_data(student_id)

@@ -18,7 +18,15 @@ from memory.session_memory import (
     mark_signal_resolved,
     mark_all_signals_resolved,
     log_completed_checkin,
-    generate_student_brief
+    generate_student_brief,
+    save_daily_plan,
+    load_daily_plan_for_today,
+    get_recent_plan_changes,
+    get_pending_conflicts,
+    resolve_pending_conflict,
+    log_plan_change,
+    get_changes_viewed_at,
+    mark_changes_viewed
 )
 
 from calendar_client import create_calendar_event
@@ -114,9 +122,16 @@ class StudentContext(TypedDict):
 SYSTEM_PROMPT = """
 You are an AI Student Success Coach.
 
-Before answering say this and continue:
+You are given the full conversation history along with each new request.
+
+If the conversation history contains no prior user messages (this is the
+very first message of the session), begin your reply with this line and
+then continue normally:
 
 "I am your AI Success Coach. I am here to help you with your learning, academic goals, study plans, subject explanations, and education-related challenges."
+
+If the history already contains prior user messages, do NOT repeat this
+introduction - just answer the new question directly.
 
 Your purpose is to support students with education-related guidance only.
 
@@ -519,6 +534,17 @@ if view == "Student":
             )
 
 
+            # BUGFIX: reload memory immediately after saving so that if
+            # the same student starts another session in this same tab
+            # (without switching the selectbox away and back), the AI
+            # already has what was just learned instead of working off
+            # the stale snapshot loaded at the start of this session.
+
+            st.session_state.student_memory = get_student_memory(
+                st.session_state.student_id
+            )
+
+
             st.success(
                 "Your session has been saved."
             )
@@ -540,11 +566,15 @@ if view == "Student":
 
 
 
-# ==================================================
-# COACH VIEW (M7 - new)
-# ==================================================
 
 
+
+
+
+
+# ==================================================
+# COACH VIEW (M7 - M9)
+# ==================================================
 
 else:
 
@@ -553,6 +583,12 @@ else:
     )
 
 
+    # -----------------------------
+    # Plan Generation Controls
+    # (defined FIRST so it's available to the
+    # conflict-resolution block below)
+    # -----------------------------
+
     max_sessions = st.number_input(
         "Sessions coach can fit today",
         min_value=1,
@@ -560,8 +596,244 @@ else:
         value=6
     )
 
-    
 
+    # -----------------------------
+    # M9: load persisted plan.
+    #
+    # Every mutation path (Generate Daily Plan, conflict resolution,
+    # Mark Completed, Create Calendar Invites, and the M9 auto-update
+    # triggered from a student session) writes through save_daily_plan
+    # immediately, so the persisted copy is always the source of
+    # truth. We always re-sync session state from it on every render
+    # so a plan changed elsewhere (or on a previous visit to this same
+    # tab) is never stale.
+    # -----------------------------
+
+    persisted = load_daily_plan_for_today()
+
+    if persisted:
+        st.session_state.daily_plan = persisted["plan"]
+
+
+    # -----------------------------
+    # M9: banner - what changed automatically since
+    # the plan was generated, before the coach does
+    # anything else on this page.
+    #
+    # BUGFIX: previously this showed every change logged today on
+    # every single render, because nothing ever recorded "the coach
+    # has seen these already" - so the banner only ever grew and
+    # never cleared, even across page reloads. get_changes_viewed_at
+    # / mark_changes_viewed persist that watermark in mem0, scoped to
+    # today, so the banner only shows what's new since the coach last
+    # acknowledged it - and an explicit "Got it" dismiss button lets
+    # the coach clear it without that being tied to any other action.
+    # -----------------------------
+
+    last_viewed_at = get_changes_viewed_at()
+
+    changes = get_recent_plan_changes(since_timestamp=last_viewed_at)
+
+    if changes:
+
+        with st.container(border=True):
+
+            st.markdown("### 🔔 Plan updated automatically")
+
+            for c in changes:
+                st.markdown(f"- {c['text']}")
+
+            if st.button("Got it — dismiss"):
+                mark_changes_viewed()
+                st.rerun()
+
+
+    # -----------------------------
+    # M9: pending conflicts - coach must decide,
+    # system will not pick for them
+    # -----------------------------
+
+    conflicts = get_pending_conflicts()
+
+    for conflict in conflicts:
+
+        with st.container(border=True):
+
+            st.markdown("### ⚠️ Needs your call")
+
+            st.markdown(conflict["explanation"])
+
+            new_s = conflict["new_student"]
+
+            st.markdown(
+                f"**New case:** {new_s['student_name']} — {new_s['reason']}"
+            )
+
+            st.markdown("**Currently scheduled today (all high priority):**")
+
+            for c in conflict["competing_with"]:
+                st.markdown(f"- {c['student_name']} — {c['reason']}")
+
+            choice = st.radio(
+                "Who keeps today's slot?",
+                options=(
+                    [new_s["student_name"]]
+                    + [c["student_name"] for c in conflict["competing_with"]]
+                    + ["Add an extra slot instead"]
+                ),
+                key=f"conflict_choice_{conflict['_id']}"
+            )
+
+            # When the new student wins and there is more than one
+            # competitor for the slot, ask explicitly who should be
+            # bumped rather than always assuming competing_with[0].
+
+            bump_target_name = None
+
+            if choice == new_s["student_name"] and len(conflict["competing_with"]) > 1:
+
+                bump_target_name = st.selectbox(
+                    "Who should move to tomorrow to free up the slot?",
+                    options=[c["student_name"] for c in conflict["competing_with"]],
+                    key=f"conflict_bump_{conflict['_id']}"
+                )
+
+            if st.button(
+                "Confirm decision",
+                key=f"resolve_conflict_{conflict['_id']}"
+            ):
+
+                plan = st.session_state.daily_plan
+
+                today_list = plan.get("today", [])
+                tomorrow_list = plan.get("tomorrow", [])
+
+                # BUGFIX: competing_with is a snapshot taken at the
+                # moment the conflict was created. By the time the
+                # coach resolves it, today_list may have changed (a
+                # student could have been marked completed and
+                # implicitly stayed, or another auto-update already
+                # bumped them through a different path) - so the
+                # student named in the snapshot might no longer be in
+                # today_list at all. The old code did
+                # next(c for c in competing_with if ...) with no
+                # fallback, which raises StopIteration and crashes the
+                # whole resolve action in that case. This degrades
+                # gracefully instead: if the chosen bump target can't
+                # be found in the live list anymore, treat the
+                # conflict as already resolved by that other path and
+                # just close it out instead of crashing.
+
+                def _find_in_today(student_name_to_find):
+                    return next(
+                        (e for e in today_list if e["student_name"] == student_name_to_find),
+                        None
+                    )
+
+                stale_conflict = False
+
+                if choice == "Add an extra slot instead":
+
+                    today_list.append({
+                        "student_id": new_s["student_id"],
+                        "student_name": new_s["student_name"],
+                        "session_type": "stress_support",
+                        "reason": new_s["reason"],
+                        "signal_id": new_s["signal_id"],
+                        "severity": "high",
+                        "completed": False,
+                        "invited": False
+                    })
+
+
+                elif choice == new_s["student_name"]:
+
+                    if bump_target_name:
+                        bumped_meta = next(
+                            (c for c in conflict["competing_with"]
+                             if c["student_name"] == bump_target_name),
+                            None
+                        )
+                    else:
+                        bumped_meta = conflict["competing_with"][0] if conflict["competing_with"] else None
+
+                    bumped_live = _find_in_today(bumped_meta["student_name"]) if bumped_meta else None
+
+                    if bumped_meta and bumped_live:
+
+                        today_list = [
+                            e for e in today_list
+                            if e["student_id"] != bumped_live["student_id"]
+                        ]
+
+                        tomorrow_list.append({
+                            "student_id": bumped_live["student_id"],
+                            "student_name": bumped_live["student_name"],
+                            "reason": (
+                                f"Bumped to tomorrow by coach decision in favor "
+                                f"of {new_s['student_name']}."
+                            ),
+                            "signal_id": bumped_live.get("signal_id")
+                        })
+
+                    else:
+                        # The student we'd bump is no longer on today's
+                        # list at all (already moved by another path) -
+                        # nothing to bump, just add the new student.
+                        stale_conflict = True
+
+                    today_list.append({
+                        "student_id": new_s["student_id"],
+                        "student_name": new_s["student_name"],
+                        "session_type": "stress_support",
+                        "reason": new_s["reason"],
+                        "signal_id": new_s["signal_id"],
+                        "severity": "high",
+                        "completed": False,
+                        "invited": False
+                    })
+
+
+                else:
+
+                    tomorrow_list.append({
+                        "student_id": new_s["student_id"],
+                        "student_name": new_s["student_name"],
+                        "reason": (
+                            f"Coach chose to keep {choice} today; "
+                            f"{new_s['student_name']} deferred to tomorrow."
+                        ),
+                        "signal_id": new_s["signal_id"]
+                    })
+
+
+                plan["today"] = today_list
+                plan["tomorrow"] = tomorrow_list
+
+                st.session_state.daily_plan = plan
+
+                # persist using the max_sessions currently set on screen
+                save_daily_plan(plan, max_sessions)
+
+                resolve_pending_conflict(conflict["_id"])
+
+                if stale_conflict:
+                    log_plan_change(
+                        f"Coach resolved conflict: {choice} kept today's slot "
+                        f"(the original competing student had already moved "
+                        f"off today's list before this was confirmed)."
+                    )
+                else:
+                    log_plan_change(
+                        f"Coach resolved conflict: {choice} kept today's slot."
+                    )
+
+                st.rerun()
+
+
+    # -----------------------------
+    # Brief viewer
+    # -----------------------------
 
     if st.session_state.get("current_brief"):
 
@@ -570,34 +842,73 @@ else:
             expanded=True
         ):
             st.markdown(st.session_state.current_brief["text"])
-    # M7: track which signals were marked done in this session
-    # so the UI reflects it immediately without regenerating the plan
 
-    if "resolved_today" not in st.session_state:
-        st.session_state.resolved_today = set()
 
+    # -----------------------------
+    # BUGFIX (persistence across reloads/devices): "completed" and
+    # "invited" status used to live ONLY in st.session_state
+    # (resolved_today / invited_today sets), which reset on every page
+    # reload and aren't shared across devices or browser tabs - even
+    # though the plan itself is persisted via save_daily_plan. That
+    # meant a refresh (or a second coach opening the dashboard) showed
+    # everyone as "not done" / "not invited" again, with no protection
+    # against re-resolving signals or re-sending calendar invites.
+    #
+    # Both flags now live directly on each plan entry (entry["completed"],
+    # entry["invited"]) and are written through save_daily_plan
+    # immediately, the same way every other plan mutation already is.
+    # Older persisted plans (saved before this field existed) won't
+    # have the keys, so every read below uses .get(..., False).
+    # -----------------------------
 
     if st.button("Generate Daily Plan"):
 
         roster = get_student_roster()
 
-        student_ids = [
-            row["student_id"] for row in roster
-        ]
+        if not roster:
 
-        signals = get_all_signals(student_ids)
+            # Stops here instead of falling through and calling
+            # generate_daily_plan with an empty roster.
 
-        plan = generate_daily_plan(
-            signals,
-            roster,
-            max_sessions_today=max_sessions
-        )
+            st.warning("Roster is empty — check Google Sheets connection.")
 
-        st.session_state.daily_plan = plan
+        else:
 
-        # reset resolved tracking for the new plan
-        st.session_state.resolved_today = set()
+            student_ids = [
+                row["student_id"] for row in roster
+            ]
 
+            signals = get_all_signals(student_ids)
+
+            plan = generate_daily_plan(
+                signals,
+                roster,
+                max_sessions_today=max_sessions
+            )
+
+            # M9: attach severity to each today-entry so future
+            # automatic updates know who's bumpable without
+            # needing another LLM call. Also seed completed/invited
+            # so every entry has a consistent shape from the start.
+
+            signal_severity_lookup = {}
+
+            for student_block in signals:
+                for sig in student_block["signals"]:
+                    signal_severity_lookup[sig["id"]] = sig["metadata"].get("severity", "low")
+
+            for entry in plan.get("today", []):
+                sig_id = entry.get("signal_id")
+                entry["severity"] = (
+                    signal_severity_lookup.get(sig_id, "none") if sig_id else "none"
+                )
+                entry["completed"] = False
+                entry["invited"] = False
+
+            st.session_state.daily_plan = plan
+
+            # M9: persist so it's visible across sessions/devices
+            save_daily_plan(plan, max_sessions)
 
 
     plan = st.session_state.daily_plan
@@ -608,6 +919,9 @@ else:
 
         st.subheader("Today")
 
+        if not plan.get("today"):
+            st.caption("No sessions scheduled today.")
+
         for entry in plan.get("today", []):
 
             col1, col2 = st.columns([4, 1])
@@ -616,12 +930,13 @@ else:
 
             signal_id = entry.get("signal_id")
 
-            # use student_id as the tracking key when there's no signal_id,
-            # so each no-signal entry can still be marked done independently
+            # Done is driven ONLY by the coach explicitly clicking
+            # "Mark Completed" — nothing else (plan generation,
+            # calendar creation, background signal changes) can flip
+            # this. Read directly off the persisted entry, not session
+            # state, so it survives reloads.
 
-            tracking_key = signal_id or f"checkin_{entry['student_id']}"
-
-            is_done = tracking_key in st.session_state.resolved_today
+            is_done = entry.get("completed", False)
 
 
             with col1:
@@ -657,33 +972,47 @@ else:
 
                     if st.button(
                         "Mark Completed",
-                        key=f"resolve_{tracking_key}"
+                        key=f"resolve_{signal_id or ('checkin_' + entry['student_id'])}"
                     ):
-                        
+
+                        # This is the ONLY place signals are ever
+                        # marked resolved. Plan generation, calendar
+                        # creation, and page reloads never touch this.
 
                         if signal_id:
 
-                            # one meeting closes ALL open signals
-                            # for this student, not just this one
+                            # One meeting closes ALL open signals for
+                            # this student, not just the one that put
+                            # them on today's plan.
                             mark_all_signals_resolved(entry["student_id"])
 
                         else:
 
+                            # Routine check-in with no originating
+                            # signal — log a completed check-in record
+                            # in mem0 so future plans know this student
+                            # was seen today.
                             log_completed_checkin(
                                 entry["student_id"],
                                 session_type,
                                 entry["reason"]
                             )
 
-                        st.session_state.resolved_today.add(tracking_key)
+                        # Persist done status directly on the plan
+                        # entry, then write the whole plan through so
+                        # it survives a reload or another device.
+                        entry["completed"] = True
+
+                        save_daily_plan(plan, max_sessions)
 
                         st.rerun()
-
-                        
 
 
 
         st.subheader("Deferred to Tomorrow")
+
+        if not plan.get("tomorrow"):
+            st.caption("No students deferred to tomorrow.")
 
         for entry in plan.get("tomorrow", []):
 
@@ -714,8 +1043,17 @@ else:
             step=5
         )
 
+        # Invited status is read off the persisted plan entry, not
+        # session state, so a reload (or someone else opening the
+        # dashboard) doesn't lose track of who already has an invite
+        # and re-send duplicates for everyone.
 
-        if plan.get("today") and st.button("Create Calendar Invites for Today"):
+        pending_invites = [
+            entry for entry in plan.get("today", [])
+            if not entry.get("invited", False)
+        ]
+
+        if pending_invites and st.button("Create Calendar Invites for Today"):
 
             start_time = datetime.now().replace(
                 hour=start_time_input.hour,
@@ -726,7 +1064,7 @@ else:
 
             created = 0
 
-            for entry in plan["today"]:
+            for entry in pending_invites:
 
                 end_time = start_time + timedelta(minutes=session_length)
 
@@ -739,8 +1077,18 @@ else:
                     end_dt=end_time
                 )
 
+                entry["invited"] = True
+
                 start_time = end_time
 
                 created += 1
 
+            # persist the invited flags so a reload doesn't forget
+            # who's already been invited
+            save_daily_plan(plan, max_sessions)
+
             st.success(f"Created {created} calendar invites starting at {start_time_input.strftime('%I:%M %p')}.")
+
+        elif plan.get("today") and not pending_invites:
+
+            st.caption("Everyone on today's list already has a calendar invite.")

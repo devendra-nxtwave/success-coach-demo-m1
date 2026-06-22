@@ -53,6 +53,51 @@ summary_model = ChatOpenAI(
 
 
 # ==================================================
+# JSON PARSING HELPER
+#
+# BUGFIX: detect_student_signal() and generate_daily_plan() both ask
+# the model to "return JSON only" and then call json.loads() directly
+# on the response. Models frequently wrap that JSON in ```json ... ```
+# fences (or add a stray sentence before/after it) even when told not
+# to - when that happens json.loads() throws, and the caller silently
+# falls back to a default ("unknown" signal / empty plan) with no
+# indication anything went wrong. This strips common wrapping before
+# parsing so a real response doesn't get discarded for a formatting
+# quirk.
+# ==================================================
+
+def _parse_json_response(text):
+
+    if not text:
+        return text
+
+    cleaned = text.strip()
+
+    if cleaned.startswith("```"):
+
+        cleaned = cleaned.strip("`")
+
+        # drop a leading language tag like "json"
+        if cleaned[:4].lower() == "json":
+            cleaned = cleaned[4:]
+
+        cleaned = cleaned.strip()
+
+    # if there's still leading/trailing prose around the object,
+    # fall back to slicing between the first { and the last }
+    if not cleaned.startswith("{"):
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+
+        if start != -1 and end != -1 and end > start:
+            cleaned = cleaned[start:end + 1]
+
+    return cleaned
+
+
+
+# ==================================================
 # FACTUAL MEMORY
 # ==================================================
 
@@ -109,6 +154,15 @@ def save_session_summary(
     client = get_mem0_client()
 
 
+    # explicit timestamp, written by us rather than relying on
+    # mem0's own created_at. generate_student_brief() needs this to
+    # know which session summaries happened after the last coach
+    # meeting - without it, every summary was being filtered out (see
+    # the fix in generate_student_brief below).
+
+    timestamp = datetime.now().isoformat()
+
+
     client.add(
 
         summary,
@@ -118,7 +172,11 @@ def save_session_summary(
         metadata={
 
             "memory_type":
-            "session_summary"
+            "session_summary",
+
+
+            "timestamp":
+            timestamp
 
         }
 
@@ -149,7 +207,7 @@ def save_student_signal(
 
 
 
-    # M7: explicit timestamp, written by us, not relying on
+    # explicit timestamp, written by us, not relying on
     # mem0's own created_at (format/availability varies by backend).
 
     timestamp = datetime.now().isoformat()
@@ -202,6 +260,12 @@ Detected At:
             "student_signal",
 
 
+            "concern":
+            signal.get(
+                "concern"
+            ),
+
+
             "severity":
             signal.get(
                 "severity"
@@ -214,14 +278,14 @@ Detected At:
             ),
 
 
-            # M7: stored explicitly so daily plan generation
+            # stored explicitly so daily plan generation
             # can reason about how old a signal is.
 
             "timestamp":
             timestamp,
 
 
-            # M7: tracks whether the coach has acted on this signal.
+            # tracks whether the coach has acted on this signal.
             # Starts unresolved until coach marks it completed.
 
             "resolved":
@@ -233,7 +297,7 @@ Detected At:
 
 
 
-    # M7: capture the memory id so the coach can later mark
+    # capture the memory id so the coach can later mark
     # this exact signal as resolved.
     # mem0's add() response shape varies by version - handle common cases.
 
@@ -457,7 +521,7 @@ Conversation:
     try:
 
         return json.loads(
-            response.content
+            _parse_json_response(response.content)
         )
 
 
@@ -556,23 +620,42 @@ def save_session_memory(
 
 
 
+    
+
     # -----------------------------
     # Save student signal M6
     # -----------------------------
 
-    signal = detect_student_signal(
+    signal = detect_student_signal(conversation)
 
-        conversation
+    signal_id = save_student_signal(student_id, signal)
 
-    )
+    
+    student_name = student_id
 
+    try:
+        from student_data import get_student_roster
+        roster = get_student_roster()
+        match = next((r for r in roster if r["student_id"] == student_id), None)
+        if match:
+            student_name = match.get("name", student_id)
+    except Exception:
+        pass
 
-    save_student_signal(
+    # NOTE: recurring-medium-severity escalation (escalate_for_recurring_pattern)
+    # is implemented further down but intentionally disabled here for now -
+    # for this demo, only a raw "high" severity signal auto-updates the plan.
+    # Re-enable by swapping this back to:
+    #
+    #   effective_signal, pattern_note = escalate_for_recurring_pattern(
+    #       student_id, signal
+    #   )
+    #   update_plan_for_new_signal(
+    #       student_id, student_name, effective_signal, signal_id, pattern_note
+    #   )
 
-        student_id,
-
-        signal
-
+    update_plan_for_new_signal(
+        student_id, student_name, signal, signal_id
     )
 
 
@@ -632,6 +715,17 @@ def get_student_memory(student_id):
         }
 
     )
+
+
+    # mem0's get_all() can return either a plain list or a
+    # dict shaped like {"results": [...]}, depending on version/
+    # backend - normalize before using the result.
+
+    if isinstance(factual_memory, dict):
+        factual_memory = factual_memory.get("results", [])
+
+    if isinstance(session_memory, dict):
+        session_memory = session_memory.get("results", [])
 
 
     return {
@@ -716,7 +810,7 @@ def get_all_signals(student_ids):
 
             for item in raw_signals
 
-            # M7: skip anything already marked resolved by the coach
+            # skip anything already marked resolved by the coach
 
             if not item.get("metadata", {}).get("resolved", False)
 
@@ -756,14 +850,34 @@ def mark_signal_resolved(signal_id):
     resolved_at = datetime.now().isoformat()
 
 
+    # some mem0 versions/backends REPLACE a record's metadata
+    # on update() rather than merge it, which would silently drop
+    # memory_type, severity, urgency, etc. Anything that later filters
+    # on those fields (e.g. get_last_meeting_timestamp, which filters
+    # explicitly on metadata.memory_type == "student_signal") would
+    # then quietly stop seeing this record at all. Fetching the
+    # existing metadata and merging the new fields into it before
+    # calling update() protects against that either way.
+
+    try:
+        existing = client.get(signal_id)
+    except Exception:
+        existing = None
+
+    if existing:
+        metadata = (existing.get("metadata", {}) or {}).copy()
+    else:
+        metadata = {}
+
+    metadata["resolved"] = True
+    metadata["resolved_at"] = resolved_at
+
+
     try:
 
         client.update(
             memory_id=signal_id,
-            metadata={
-                "resolved": True,
-                "resolved_at": resolved_at
-            }
+            metadata=metadata
         )
 
         return True
@@ -771,24 +885,30 @@ def mark_signal_resolved(signal_id):
 
     except Exception:
 
+        # the replacement is written first, and the old record is
+        # only removed once that succeeds, so a failure in add()
+        # after a successful delete() can't permanently lose the
+        # signal.
+
+        if not existing:
+
+            try:
+                existing = client.get(signal_id)
+            except Exception:
+                return False
+
         try:
 
-            existing = client.get(signal_id)
-
             text = existing.get("memory")
-            metadata = existing.get("metadata", {}) or {}
             user_id = existing.get("user_id")
-
-            metadata["resolved"] = True
-            metadata["resolved_at"] = resolved_at
-
-            client.delete(signal_id)
 
             client.add(
                 text,
                 user_id=user_id,
                 metadata=metadata
             )
+
+            client.delete(signal_id)
 
             return True
 
@@ -855,23 +975,16 @@ def mark_all_signals_resolved(student_id):
 def generate_daily_plan(signals_by_student, roster, max_sessions_today=6):
 
     id_to_name = {
-
         row["student_id"]: row.get("name", "Unknown")
-
         for row in roster
-
     }
-
 
     today_str = datetime.now().strftime("%Y-%m-%d (%A)")
 
     payload = json.dumps(signals_by_student, default=str)
 
-
     response = summary_model.invoke(
-
         f"""
-
 You are helping a student success coach plan their day.
 
 Today's date is: {today_str}
@@ -925,11 +1038,12 @@ STEP 2: Rank students and fill today's schedule
 
 - Sort all students by priority level (their worst unresolved signal),
   highest concern first.
-- Each student appears AT MOST ONCE in the entire plan , even if they have multiple unresolved signals. Pick their
-  single worst signal to justify the one session - do not create separate
-  entries for the same student's different signals.
-- Fill up to {max_sessions_today} "today" slots starting from the highest
-  priority students down.
+- Each student appears AT MOST ONCE in the entire plan, even if they
+  have multiple unresolved signals. Pick their single worst signal to
+  justify the one session - do not create separate entries for the same
+  student's different signals.
+- Fill up to {max_sessions_today} "today" slots starting from the
+  highest priority students down.
 - High severity or clearly overdue issues should almost always get a slot.
 - If there is room left in the {max_sessions_today} slots after placing
   every student who has a real concern, use the remaining slots for
@@ -1036,24 +1150,40 @@ enough that the original timing plausibly still holds, or if nothing in
 the data suggests it has passed.
 
 """
-
     )
 
-
     try:
-
-        return json.loads(response.content)
-
-
+        plan = json.loads(_parse_json_response(response.content))
     except Exception:
+        return {"today": [], "tomorrow": []}
 
-        return {
+    # --- M7 SIGNAL ID VALIDATION ---
+    # Build the complete set of real signal IDs from the data we
+    # actually passed to the model. If the model hallucinated an ID
+    # or copied one incorrectly, null it out rather than letting a
+    # bad reference propagate into the plan. A null signal_id is
+    # handled safely everywhere downstream (mark_all_signals_resolved
+    # resolves by student_id, and log_completed_checkin is called
+    # instead when signal_id is None).
 
-            "today": [],
+    valid_signal_ids = {
+        sig["id"]
+        for student_block in signals_by_student
+        for sig in student_block["signals"]
+        if sig.get("id")
+    }
 
-            "tomorrow": []
+    for entry in plan.get("today", []):
+        sid = entry.get("signal_id")
+        if sid and sid not in valid_signal_ids:
+            entry["signal_id"] = None
 
-        }
+    for entry in plan.get("tomorrow", []):
+        sid = entry.get("signal_id")
+        if sid and sid not in valid_signal_ids:
+            entry["signal_id"] = None
+
+    return plan
 
 # ==================================================
 # M7: LOG A COMPLETED CHECK-IN (no prior signal existed)
@@ -1219,11 +1349,18 @@ def generate_student_brief(student_id, academic_data):
 
     all_sessions = memory.get("session_summary", [])
 
+    # session summary timestamps live under metadata (see
+    # save_session_summary), with created_at as a fallback for older
+    # records saved before that field existed.
+
+    def _session_timestamp(s):
+        return s.get("metadata", {}).get("timestamp") or s.get("created_at")
+
     if last_meeting_at:
 
         sessions_since_last_meeting = [
             s for s in all_sessions
-            if s.get("timestamp") and s["timestamp"] > last_meeting_at
+            if _session_timestamp(s) and _session_timestamp(s) > last_meeting_at
         ]
 
     else:
@@ -1311,3 +1448,584 @@ Rules:
 
 
     return response.content
+# ==================================================
+# M9: PERSISTENT DAILY PLAN STORAGE
+# Stored in mem0 under a fixed coach-level id so any
+# process (student session or coach session) can read/
+# write the same plan. Keyed by date.
+# ==================================================
+
+PLAN_OWNER_ID = "__coach_daily_plan__"
+
+
+def _today_key():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def save_daily_plan(plan, max_sessions_today):
+    """
+    Overwrites today's persisted plan.
+
+    ORDERING FIX: write the new record FIRST, then delete the old one.
+    The previous version deleted first and then wrote - if the write
+    failed after a successful delete, today's plan was permanently lost
+    with no recovery path. Writing first means a failure in delete()
+    leaves a harmless duplicate (the next load will just see two records
+    and use the first one) rather than losing the plan entirely.
+    """
+
+    client = get_mem0_client()
+
+    date_key = _today_key()
+
+    payload = {
+        "date": date_key,
+        "max_sessions_today": max_sessions_today,
+        "plan": plan
+    }
+
+    # Write the new record first.
+    client.add(
+        json.dumps(payload, default=str),
+        user_id=PLAN_OWNER_ID,
+        metadata={
+            "memory_type": "daily_plan",
+            "date": date_key
+        }
+    )
+
+    # Now remove any previously existing records for today.
+    # If this fails, the worst outcome is a duplicate - load_daily_plan_for_today
+    # reads raw[0] which will be the record just written (mem0 returns
+    # newest first in most backends), so the plan is still correct.
+    existing = client.get_all(
+        filters={
+            "AND": [
+                {"user_id": PLAN_OWNER_ID},
+                {"metadata": {"memory_type": "daily_plan"}},
+                {"metadata": {"date": date_key}}
+            ]
+        }
+    )
+
+    raw = existing.get("results", []) if isinstance(existing, dict) else existing
+
+    # Keep the most recently written record (last in list after add),
+    # delete everything else.
+    if len(raw) > 1:
+        # Sort by timestamp if available so we keep the newest.
+        # If timestamps are unavailable, keep the last element
+        # (mem0 typically appends, so last = most recent).
+        def _ts(item):
+            return item.get("metadata", {}).get("timestamp") or item.get("created_at") or ""
+
+        sorted_records = sorted(raw, key=_ts)
+        records_to_delete = sorted_records[:-1]  # delete all but the newest
+
+        for item in records_to_delete:
+            try:
+                client.delete(item.get("id"))
+            except Exception:
+                pass
+
+
+def load_daily_plan_for_today():
+
+    client = get_mem0_client()
+
+    date_key = _today_key()
+
+    result = client.get_all(
+        filters={
+            "AND": [
+                {"user_id": PLAN_OWNER_ID},
+                {"metadata": {"memory_type": "daily_plan"}},
+                {"metadata": {"date": date_key}}
+            ]
+        }
+    )
+
+    raw = result.get("results", []) if isinstance(result, dict) else result
+
+    if not raw:
+        return None
+
+    try:
+        return json.loads(raw[0].get("memory"))
+    except Exception:
+        return None
+
+
+# ==================================================
+# M9: PLAN CHANGE LOG
+# Human-readable change entries shown to the coach as
+# a banner the next time they open the dashboard - this
+# is the "summary of what changed and why" requirement.
+# ==================================================
+
+def log_plan_change(summary_text):
+
+    client = get_mem0_client()
+
+    client.add(
+        summary_text,
+        user_id=PLAN_OWNER_ID,
+        metadata={
+            "memory_type": "plan_change",
+            "date": _today_key(),
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+
+def get_recent_plan_changes(since_timestamp=None):
+
+    client = get_mem0_client()
+
+    result = client.get_all(
+        filters={
+            "AND": [
+                {"user_id": PLAN_OWNER_ID},
+                {"metadata": {"memory_type": "plan_change"}},
+                {"metadata": {"date": _today_key()}}
+            ]
+        }
+    )
+
+    raw = result.get("results", []) if isinstance(result, dict) else result
+
+    changes = [
+        {
+            "text": item.get("memory"),
+            "timestamp": item.get("metadata", {}).get("timestamp")
+        }
+        for item in raw
+    ]
+
+    if since_timestamp:
+        changes = [c for c in changes if c["timestamp"] and c["timestamp"] > since_timestamp]
+
+    changes.sort(key=lambda c: c["timestamp"] or "")
+
+    return changes
+
+
+# ==================================================
+# BUGFIX (banner never clearing): get_recent_plan_changes()
+# already supported filtering by since_timestamp, but nothing
+# ever persisted "the coach has seen changes up to here" - so
+# every dashboard load re-showed every change logged that day,
+# growing forever. These two functions persist that watermark
+# in mem0 (coach-level, keyed by date) so it survives reloads
+# and works across devices/sessions, the same way the plan and
+# conflicts already do.
+# ==================================================
+
+def get_changes_viewed_at():
+
+    client = get_mem0_client()
+
+    result = client.get_all(
+        filters={
+            "AND": [
+                {"user_id": PLAN_OWNER_ID},
+                {"metadata": {"memory_type": "changes_viewed"}},
+                {"metadata": {"date": _today_key()}}
+            ]
+        }
+    )
+
+    raw = result.get("results", []) if isinstance(result, dict) else result
+
+    if not raw:
+        return None
+
+    return raw[0].get("metadata", {}).get("timestamp")
+
+
+def mark_changes_viewed():
+
+    client = get_mem0_client()
+
+    date_key = _today_key()
+
+    existing = client.get_all(
+        filters={
+            "AND": [
+                {"user_id": PLAN_OWNER_ID},
+                {"metadata": {"memory_type": "changes_viewed"}},
+                {"metadata": {"date": date_key}}
+            ]
+        }
+    )
+
+    raw = existing.get("results", []) if isinstance(existing, dict) else existing
+
+    for item in raw:
+        try:
+            client.delete(item.get("id"))
+        except Exception:
+            pass
+
+    client.add(
+        "changes_viewed_marker",
+        user_id=PLAN_OWNER_ID,
+        metadata={
+            "memory_type": "changes_viewed",
+            "date": date_key,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+
+# ==================================================
+# M9: PENDING CONFLICTS
+# Used when two+ students are both critical and there
+# isn't a clear slot to free up - the system does NOT
+# decide, it asks the coach.
+# ==================================================
+
+def add_pending_conflict(conflict):
+
+    client = get_mem0_client()
+
+    client.add(
+        json.dumps(conflict, default=str),
+        user_id=PLAN_OWNER_ID,
+        metadata={
+            "memory_type": "plan_conflict",
+            "date": _today_key(),
+            "resolved": False,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+
+def get_pending_conflicts():
+
+    client = get_mem0_client()
+
+    result = client.get_all(
+        filters={
+            "AND": [
+                {"user_id": PLAN_OWNER_ID},
+                {"metadata": {"memory_type": "plan_conflict"}},
+                {"metadata": {"date": _today_key()}}
+            ]
+        }
+    )
+
+    raw = result.get("results", []) if isinstance(result, dict) else result
+
+    conflicts = []
+
+    for item in raw:
+
+        if item.get("metadata", {}).get("resolved", False):
+            continue
+
+        try:
+            data = json.loads(item.get("memory"))
+        except Exception:
+            continue
+
+        data["_id"] = item.get("id")
+        conflicts.append(data)
+
+    return conflicts
+
+
+def resolve_pending_conflict(conflict_id):
+
+    client = get_mem0_client()
+
+    # Fetch existing metadata first and merge "resolved: True" into it
+    # rather than passing only {"resolved": True} to client.update().
+    # Some mem0 versions/backends REPLACE a record's metadata on
+    # update() instead of merging - passing only the new field would
+    # silently drop memory_type, date, and timestamp, causing
+    # get_pending_conflicts() to never find this record again and
+    # potentially showing it as unresolved on the next load.
+    # This is the same fetch-merge pattern already used in
+    # mark_signal_resolved().
+
+    try:
+        existing = client.get(conflict_id)
+    except Exception:
+        existing = None
+
+    if existing:
+        metadata = (existing.get("metadata", {}) or {}).copy()
+    else:
+        metadata = {}
+
+    metadata["resolved"] = True
+
+    try:
+        client.update(
+            memory_id=conflict_id,
+            metadata=metadata
+        )
+
+    except Exception:
+
+        # Fallback: write a new record with the merged metadata then
+        # delete the old one. Write first so a failure in delete()
+        # leaves a duplicate rather than losing the record entirely.
+
+        if not existing:
+            try:
+                existing = client.get(conflict_id)
+            except Exception:
+                return
+
+        try:
+            text = existing.get("memory")
+            user_id = existing.get("user_id")
+
+            client.add(
+                text,
+                user_id=user_id,
+                metadata=metadata
+            )
+
+            client.delete(conflict_id)
+
+        except Exception:
+            pass
+
+
+# ==================================================
+# M9: ESCALATE FOR RECURRING PATTERN
+#
+# generate_daily_plan() (a full replan) already reasons about a
+# student's ENTIRE unresolved signal history and raises effective
+# urgency when the same concern repeats across multiple "medium"
+# signals - but update_plan_for_new_signal() only ever looked at the
+# single signal just detected, so a student quietly stacking up
+# several medium-severity signals on the same recurring concern would
+# never trigger an automatic plan update in between full replans -
+# only "Generate Daily Plan" would eventually catch it.
+#
+# This mirrors that same reasoning at the single-signal hot path: if
+# the new signal is "medium" and there are enough other unresolved
+# signals about the same concern, treat it as effectively "high" for
+# the purposes of deciding whether to touch today's plan, and attach
+# a note explaining why so the coach sees the real reason in the
+# change log rather than a bare severity bump.
+# ==================================================
+
+RECURRING_PATTERN_THRESHOLD = 2  # this signal + at least this many prior matches
+
+
+def _concern_key(concern_text):
+    return (concern_text or "").strip().lower()
+
+
+def escalate_for_recurring_pattern(student_id, signal):
+    """
+    Returns (effective_signal, pattern_note).
+
+    effective_signal is a shallow copy of `signal` with severity
+    possibly bumped to "high". pattern_note is None unless an
+    escalation happened, in which case it's a short human-readable
+    explanation suitable for the plan change log.
+    """
+
+    effective = dict(signal)
+
+    if signal.get("severity") != "medium":
+        return effective, None
+
+    concern = _concern_key(signal.get("concern"))
+
+    if not concern or concern == "none":
+        return effective, None
+
+    try:
+        existing = get_all_signals([student_id])
+        open_signals = existing[0]["signals"] if existing else []
+    except Exception:
+        return effective, None
+
+    matching_medium_count = sum(
+        1
+        for s in open_signals
+        if s.get("metadata", {}).get("severity") == "medium"
+        and _concern_key(s.get("metadata", {}).get("concern")) == concern
+    )
+
+    # the signal we just saved is itself already in open_signals
+    # (get_all_signals only excludes resolved ones), so
+    # matching_medium_count already includes it.
+
+    if matching_medium_count >= RECURRING_PATTERN_THRESHOLD:
+
+        effective["severity"] = "high"
+
+        pattern_note = (
+            f"'{signal.get('concern')}' has now come up as a medium-severity "
+            f"concern {matching_medium_count} times without being resolved - "
+            f"treating it as a recurring pattern."
+        )
+
+        return effective, pattern_note
+
+    return effective, None
+
+
+# ==================================================
+# M9: UPDATE PLAN WHEN A SERIOUS SIGNAL SURFACES
+# Called right after a new signal is saved during a
+# student session. Acts on "high" severity (including
+# severity escalated by escalate_for_recurring_pattern
+# above) - that's what "serious concern" means here.
+# ==================================================
+
+def update_plan_for_new_signal(student_id, student_name, signal, signal_id, pattern_note=None):
+
+    if signal.get("severity") != "high":
+        return  # not serious enough to touch the plan
+
+    state = load_daily_plan_for_today()
+
+    if not state:
+        # No plan generated yet today - nothing to update.
+        # Next "Generate Daily Plan" run will naturally pick this up.
+        return
+
+    plan = state["plan"]
+    max_sessions = state["max_sessions_today"]
+
+    today_list = plan.get("today", [])
+    tomorrow_list = plan.get("tomorrow", [])
+
+    if pattern_note:
+        reason_text = (
+            f"Recurring concern flagged again: {signal.get('concern')}. "
+            f"{pattern_note} Recommended action: {signal.get('recommended_action')}."
+        )
+    else:
+        reason_text = (
+            f"New high-severity concern flagged: {signal.get('concern')}. "
+            f"Recommended action: {signal.get('recommended_action')}."
+        )
+
+    # Already has a slot today - just note it, don't duplicate
+    if any(e.get("student_id") == student_id for e in today_list):
+        log_plan_change(
+            f"{student_name} already has a session today; a new serious "
+            f"concern came in ({signal.get('concern')}) - same slot now "
+            f"covers this too."
+        )
+        return
+
+    new_entry = {
+        "student_id": student_id,
+        "student_name": student_name,
+        "session_type": "stress_support" if "stress" in signal.get("concern", "").lower() else "academic_support",
+        "reason": reason_text,
+        "signal_id": signal_id,
+        "severity": "high",
+        "completed": False,
+        "invited": False
+    }
+
+    # Room available - just add it
+    if len(today_list) < max_sessions:
+
+        today_list.append(new_entry)
+        plan["today"] = today_list
+
+        log_plan_change(
+            f"Added {student_name} to today's plan - {reason_text}"
+        )
+
+        save_daily_plan(plan, max_sessions)
+        return
+
+    # No room - look for a slot to free up: anyone today whose
+    # severity is NOT high can be bumped to tomorrow.
+    bumpable = [e for e in today_list if e.get("severity") != "high"]
+
+    if bumpable:
+
+        priority_order = {"none": 0, "low": 1, "medium": 2}
+        bumpable.sort(key=lambda e: priority_order.get(e.get("severity", "none"), 0))
+
+        bumped = bumpable[0]
+        today_list.remove(bumped)
+
+        bumped_for_tomorrow = {
+            "student_id": bumped["student_id"],
+            "student_name": bumped["student_name"],
+            "reason": (
+                f"Moved from today to tomorrow to make room for a more "
+                f"urgent case ({student_name} - {signal.get('concern')})."
+            ),
+            "signal_id": bumped.get("signal_id")
+        }
+
+        tomorrow_list.append(bumped_for_tomorrow)
+        today_list.append(new_entry)
+
+        plan["today"] = today_list
+        plan["tomorrow"] = tomorrow_list
+
+        log_plan_change(
+            f"{student_name} added to today's plan ({reason_text}). "
+            f"{bumped['student_name']} moved to tomorrow to free the slot - "
+            f"their concern was lower priority."
+        )
+
+        save_daily_plan(plan, max_sessions)
+        return
+
+    # Every slot today is already "high" severity - the system will
+    # NOT decide who loses their slot. Surface it to the coach.
+    explanation_text = (
+        f"{student_name} just flagged a high-severity concern "
+        f"({signal.get('concern')}), but today's schedule is full and "
+        f"every current slot is also high severity. Pick who keeps "
+        f"today's slot, who moves to tomorrow, or add an extra slot."
+    )
+
+    if pattern_note:
+        explanation_text = (
+            f"{student_name}'s concern ({signal.get('concern')}) has been "
+            f"recurring at medium severity and is now being treated as high "
+            f"priority - {pattern_note} Today's schedule is full and every "
+            f"current slot is also high severity. Pick who keeps today's "
+            f"slot, who moves to tomorrow, or add an extra slot."
+        )
+
+    add_pending_conflict({
+        "new_student": {
+            "student_id": student_id,
+            "student_name": student_name,
+            "reason": reason_text,
+            "signal_id": signal_id
+        },
+        "competing_with": [
+            {
+                "student_id": e["student_id"],
+                "student_name": e["student_name"],
+                "reason": e.get("reason"),
+
+                # include signal_id here so that if the coach later
+                # bumps this student to tomorrow via the conflict
+                # resolution UI, the original signal that justified
+                # their slot isn't lost.
+
+                "signal_id": e.get("signal_id")
+            }
+            for e in today_list
+        ],
+        "explanation": explanation_text
+    })
+
+    log_plan_change(
+        f"⚠️ Conflict: {student_name}'s {'recurring' if pattern_note else 'new high-severity'} "
+        f"concern can't be slotted today without bumping another critical "
+        f"student - needs your call."
+    )
